@@ -72,7 +72,9 @@ def safe_reward(
 ) -> Tuple[Tensor, Tensor]:
     # Numerically stable version of reward function as explained in Section "Numerically stable reward function"
     # Assumes samples are in the first dimension, so (samples, batch, violations)
-    weighted_violations_SB = beta * violations_SBY.sum(dim=-1)
+    # .float(): violations are an integer (bool) count; torch.mean below requires a
+    # float dtype (newer torch errors on mean of Long). Semantically a no-op.
+    weighted_violations_SB = beta * violations_SBY.sum(dim=-1).float()
     mean_violations_B = torch.mean(weighted_violations_SB, dim=0)
     min_violations_B = torch.min(weighted_violations_SB, dim=0)[0]
     L_B = torch.minimum(mean_violations_B, max_exp_val + min_violations_B)
