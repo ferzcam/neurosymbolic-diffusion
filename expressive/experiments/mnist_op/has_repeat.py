@@ -60,26 +60,31 @@ def ece(conf, correct, n_bins=15):
 
 
 @torch.no_grad()
-def evaluate(model, loader, n, device):
-    """Fair readout: denoiser concept marginal -> exact P(has-repeat) via subset-DP."""
+def evaluate(model, loader, n, device, task="repeat"):
+    """Fair readout from the denoiser concept marginal. repeat: exact P(repeat) via subset-DP;
+    sum: predicted sum from argmax digits."""
     dacc, lacc, P, T = [], [], [], []
     for batch in loader:
         imgs, concepts, label = batch[:n], batch[n:2 * n], batch[-1]
         x = torch.cat(imgs, dim=1).to(device)
         gt = torch.stack(concepts, dim=1).to(device)          # [B,n]
-        y = label.to(device).long()                           # [B] in {0,1}
+        y = label.to(device).long()
         B = x.shape[0]
         enc = model.p.encode_x(x)
-        masked = torch.full((B, n), 10, device=device)        # all masked (mask=vocab_dim)
+        masked = torch.full((B, n), 10, device=device)
         p = model.p.distribution(masked, enc, torch.zeros(B, device=device))[..., :10]
-        prep = (1 - p_all_distinct(p)).clamp(0, 1)            # P(has repeat)
         dacc.append((p.argmax(-1) == gt).float().mean().item())
-        lacc.append(((prep > 0.5).long() == y).float().mean().item())
-        P.append(prep.cpu()); T.append(y.cpu())
-    P = torch.cat(P); T = torch.cat(T)
-    conf = torch.where(P > 0.5, P, 1 - P); corr = (P > 0.5).long() == T
-    return dict(concept_acc=float(np.mean(dacc)), label_acc=float(np.mean(lacc)),
-                label_ece=ece(conf, corr))
+        if task == "sum":
+            lacc.append((p.argmax(-1).sum(-1) == y).float().mean().item())
+        else:
+            prep = (1 - p_all_distinct(p)).clamp(0, 1)
+            lacc.append(((prep > 0.5).long() == y).float().mean().item())
+            P.append(prep.cpu()); T.append(y.cpu())
+    out = dict(concept_acc=float(np.mean(dacc)), label_acc=float(np.mean(lacc)), label_ece=float("nan"))
+    if task == "repeat":
+        P = torch.cat(P); T = torch.cat(T)
+        out["label_ece"] = ece(torch.where(P > 0.5, P, 1 - P), (P > 0.5).long() == T)
+    return out
 
 
 class HasRepeatModel(UnmaskingModel):
@@ -97,33 +102,39 @@ class HasRepeatModel(UnmaskingModel):
 
 
 class HasRepeatProblem(Problem):
-    def __init__(self, n: int):
-        self.n = n
+    """task='repeat' (non-decomposable) or 'sum' (decomposable control)."""
+    def __init__(self, n: int, task: str = "repeat"):
+        self.n = n; self.task = task
 
     def shape_w(self) -> torch.Size:
         return (self.n, 10)
 
     def shape_y(self) -> torch.Size:
-        return (1, 2)
+        return (1, 2) if self.task == "repeat" else (1, 9 * self.n + 1)
 
     def y_from_w(self, w_SKBn: torch.Tensor) -> torch.Tensor:
         assert (w_SKBn < 10).all()
+        if self.task == "sum":
+            return w_SKBn.sum(-1, keepdim=True)
         eq = (w_SKBn.unsqueeze(-1) == w_SKBn.unsqueeze(-2)).sum(-1).sum(-1)  # n + 2*#pairs
         has = (eq > self.n).long()
         return has.unsqueeze(-1)
 
 
 def main():
+    import sys
+    task = "sum" if "--task=sum" in sys.argv or ("--task" in sys.argv and "sum" in sys.argv) else "repeat"
     args = MNISTAbsorbingArguments(explicit_bool=True).parse_args(known_only=True)
     n = args.N                                   # reuse --N as the SET SIZE
     device = get_device(args)
-    print(f"NeSyDM has-a-repeat  n={n}  device={device}  epochs={args.epochs}")
+    print(f"NeSyDM task={task}  n={n}  device={device}  epochs={args.epochs}")
 
-    model = SimpleNeSyDiffusion(HasRepeatModel(n, args), HasRepeatProblem(n), args).to(device)
+    model = SimpleNeSyDiffusion(HasRepeatModel(n, args), HasRepeatProblem(n, task), args).to(device)
 
+    op = (lambda labels: int(sum(int(l) for l in labels))) if task == "sum" else has_repeat_op
     train_loader, val_loader, test_loader = get_mnist_op_dataloaders(
         count_train=int(50000 / n), count_val=int(10000 / n), count_test=int(10000 / n),
-        batch_size=args.batch_size, n_operands=n, op=has_repeat_op, shuffle=True,
+        batch_size=args.batch_size, n_operands=n, op=op, shuffle=True,
     )
 
     class _Log:                                  # minimal stand-in for TrainingLog
@@ -146,8 +157,8 @@ def main():
             loss = model.loss(x, label, log, w_labels)
             loss.backward(); optim.step()
         print(f"epoch {epoch} loss {float(loss):.4f} time {time.time()-t0:.1f}s")
-    m = evaluate(model, test_loader, n, device)
-    print(f"NeSyDM n={n}: concept-acc {m['concept_acc']:.3f}  label-acc {m['label_acc']:.3f}  "
+    m = evaluate(model, test_loader, n, device, task)
+    print(f"NeSyDM task={task} n={n}: concept-acc {m['concept_acc']:.3f}  label-acc {m['label_acc']:.3f}  "
           f"label-ECE {m['label_ece']:.3f}")
 
 
