@@ -59,11 +59,22 @@ def ece(conf, correct, n_bins=15):
     return float(e)
 
 
+def sum_dist(p):                                              # p:[B,n,10] -> [B,9n+1] exact
+    B, n, _ = p.shape
+    d = p[:, 0]
+    for i in range(1, n):
+        L = d.shape[1]; nd = p.new_zeros(B, L + 9)
+        for v in range(10):
+            nd[:, v:v + L] = nd[:, v:v + L] + d * p[:, i, v:v + 1]
+        d = nd
+    return d
+
+
 @torch.no_grad()
 def evaluate(model, loader, n, device, task="repeat"):
     """Fair readout from the denoiser concept marginal. repeat: exact P(repeat) via subset-DP;
-    sum: predicted sum from argmax digits."""
-    dacc, lacc, P, T = [], [], [], []
+    sum: exact sum distribution via convolution. Both report label-acc AND ECE."""
+    dacc, conf_all, corr_all = [], [], []
     for batch in loader:
         imgs, concepts, label = batch[:n], batch[n:2 * n], batch[-1]
         x = torch.cat(imgs, dim=1).to(device)
@@ -75,16 +86,15 @@ def evaluate(model, loader, n, device, task="repeat"):
         p = model.p.distribution(masked, enc, torch.zeros(B, device=device))[..., :10]
         dacc.append((p.argmax(-1) == gt).float().mean().item())
         if task == "sum":
-            lacc.append((p.argmax(-1).sum(-1) == y).float().mean().item())
+            sd = sum_dist(p); pred = sd.argmax(-1)
+            conf = sd.max(-1).values; corr = (pred == y)
         else:
             prep = (1 - p_all_distinct(p)).clamp(0, 1)
-            lacc.append(((prep > 0.5).long() == y).float().mean().item())
-            P.append(prep.cpu()); T.append(y.cpu())
-    out = dict(concept_acc=float(np.mean(dacc)), label_acc=float(np.mean(lacc)), label_ece=float("nan"))
-    if task == "repeat":
-        P = torch.cat(P); T = torch.cat(T)
-        out["label_ece"] = ece(torch.where(P > 0.5, P, 1 - P), (P > 0.5).long() == T)
-    return out
+            conf = torch.where(prep > 0.5, prep, 1 - prep); corr = (prep > 0.5).long() == y
+        conf_all.append(conf.cpu()); corr_all.append(corr.cpu())
+    conf = torch.cat(conf_all); corr = torch.cat(corr_all)
+    return dict(concept_acc=float(np.mean(dacc)), label_acc=float(corr.float().mean()),
+                label_ece=ece(conf, corr))
 
 
 class HasRepeatModel(UnmaskingModel):

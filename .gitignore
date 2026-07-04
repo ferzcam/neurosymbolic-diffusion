@@ -30,3 +30,9 @@ rssgen/rssgen.egg-info/
 *.pt
 
 *.DS_Store
+runs_orbit_nesydm/
+runs_multiset/
+data/
+*.egg-info/
+wandb/
+models/

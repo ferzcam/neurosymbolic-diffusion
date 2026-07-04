@@ -125,7 +125,25 @@ class SimpleNeSyDiffusion(BaseNeSyDiffusion):
         # y RLOO denoising loss
         #####################
          # Compute log probs of tw_0
-        log_probs_SB = tw_0.log_prob(tw_0_SBW).sum(-1)
+        orbit_M = getattr(self, "orbit_M", 0)
+        if orbit_M > 0:
+            # Orbit-averaged score: average log q over M value-relabelings sigma in S_V (the
+            # label-symmetry group; y_from_w is relabeling-invariant so the reward is unchanged).
+            # Replaces the raw score dlog q(w) with a q-weighted average of dlog q(sigma.w),
+            # which projects out the reward-unidentifiable direction and aligns the gradient.
+            V = p_w_0_BWD.shape[-1]
+            dev = tw_0_SBW.device
+            sig_MV = torch.stack([torch.randperm(V, device=dev) for _ in range(orbit_M)])
+            sig_MV[0] = torch.arange(V, device=dev)                     # anchor identity
+            w_sig_MSBW = sig_MV[:, tw_0_SBW]                            # [M,S,B,W]
+            logq_MSB = tw_0.log_prob(w_sig_MSBW).sum(-1)               # [M,S,B]
+            wts_MSB = torch.softmax(logq_MSB.detach(), dim=0)          # q-weighted (self-norm)
+            log_probs_SB = (wts_MSB * logq_MSB).sum(0)                 # [S,B]
+            # DIAGNOSTIC: effective # of orbit members (ESS). ~1 => averaging collapsed to
+            # identity (carry-over one-hot positions kill relabeled worlds); ~M => full averaging.
+            self.orbit_ess = float((1.0 / wts_MSB.pow(2).sum(0)).mean())
+        else:
+            log_probs_SB = tw_0.log_prob(tw_0_SBW).sum(-1)
         # Compute all constraints for y
         constraint_y0_SBY = (y_0_BY[None, :, :] == ty_0_SBY).float()
         reward_y_0_SBY = constraint_y0_SBY
