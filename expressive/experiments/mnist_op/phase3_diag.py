@@ -128,9 +128,12 @@ def save_preds(model, loader, n, device, path):
 
 def main():
     orbit_M = _get_int("--orbit_M", 0)
+    seed = _get_int("--seed", 0)
     args = MNISTAbsorbingArguments(explicit_bool=True).parse_args(known_only=True)
     n = args.N; device = get_device(args)
-    tag = f"phase3_n{n}_orbitM{orbit_M}"
+    torch.manual_seed(seed); np.random.seed(seed)          # reproducible per-seed runs
+    # unique tag per (config, seed) so seed-swept array tasks never overwrite each other
+    tag = f"phase3_n{n}_M{orbit_M}_ew{args.entropy_weight}_de{int(bool(args.denoising_entropy))}_s{seed}"
     outdir = os.path.join("runs_orbit_nesydm", tag); os.makedirs(outdir, exist_ok=True)
     logpath = os.path.join(outdir, "train.log")
     # header: full diagnostic columns
