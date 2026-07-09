@@ -201,63 +201,72 @@ class GraphProblem(Problem):
 
 
 # ----------------------------------------------------------------------------------------------
-# Visual Latin square (order 4): 16 cells, symbols {0..3} (V=4), DENSE graded reward.
-# Ported from method/latin_train.py: reward r(w) = (#all-different among 4 rows+4 cols)/8, S_4-invariant.
+# Visual Latin square (order n): n*n cells, symbols {0..n-1} (V=n), DENSE graded reward.
+# Ported from method/latin_train.py: r(w) = (#all-different among n rows+n cols)/(2n), S_n-invariant.
+# n=4 enumerates the 576 squares; n>=5 generates random squares (cyclic base + random row/col/symbol
+# perms -- all preserve the Latin property, reject-free).
 # ----------------------------------------------------------------------------------------------
-V_LATIN, N_LATIN = 4, 16
-
-
-def all_latin_squares(V=4):
-    perms = [list(p) for p in itertools.permutations(range(V))]
+def all_latin_squares(n=4):
+    perms = [list(p) for p in itertools.permutations(range(n))]
     res = []
 
     def ok(rows, p):
-        return all(all(p[c] != rows[r][c] for r in range(len(rows))) for c in range(V))
+        return all(all(p[c] != rows[r][c] for r in range(len(rows))) for c in range(n))
 
     def bt(rows):
-        if len(rows) == V:
+        if len(rows) == n:
             res.append([x for r in rows for x in r]); return
         for p in perms:
             if ok(rows, p):
                 bt(rows + [p])
     bt([])
-    return torch.tensor(res, dtype=torch.long)           # [576, 16]
+    return torch.tensor(res, dtype=torch.long)
 
 
-_LATIN = all_latin_squares(V_LATIN)
+def random_latin_square(n, rng):
+    base = [[(i + j) % n for j in range(n)] for i in range(n)]
+    rp = list(range(n)); rng.shuffle(rp)
+    cp = list(range(n)); rng.shuffle(cp)
+    sp = list(range(n)); rng.shuffle(sp)
+    return [sp[base[rp[i]][cp[j]]] for i in range(n) for j in range(n)]
 
 
-def latin_reward(w):                                     # w[...,16] in {0..3} -> r[...] in [0,1]
+def latin_reward(w):                                     # w[...,n*n] in {0..n-1} -> r[...] in [0,1]
+    ncell = w.shape[-1]; n = int(round(ncell ** 0.5))
     lead = w.shape[:-1]
-    g = w.reshape(*lead, V_LATIN, V_LATIN)
+    g = w.reshape(*lead, n, n)
 
     def alldiff(x):
-        return (F.one_hot(x, V_LATIN).sum(-2) == 1).all(-1)
+        return (F.one_hot(x, n).sum(-2) == 1).all(-1)
     rows = alldiff(g).float().sum(-1)
     cols = alldiff(g.transpose(-1, -2)).float().sum(-1)
-    return (rows + cols) / (2 * V_LATIN)
+    return (rows + cols) / (2 * n)
 
 
-def gen_latin_sets(ypool, n_sets, seed):
-    """Balanced sampling over the 576 Latin squares; each cell = random MNIST image of its symbol.
-    Returns (image indices [n_sets,16], lab=ones). true concepts come from ypool[idx] as elsewhere."""
+def gen_latin_sets(ypool, n_sets, seed, n=4, enum=None):
+    """Balanced sampling over Latin squares (n=4 enumerated, n>=5 random); each cell = random MNIST
+    image of its symbol. Returns (image indices [n_sets,n*n], lab=ones); true concepts = ypool[idx]."""
     rng = random.Random(seed)
-    by_digit = [(ypool == d).nonzero().flatten() for d in range(V_LATIN)]
-    idx = torch.zeros(n_sets, N_LATIN, dtype=torch.long)
+    by_digit = [(ypool == d).nonzero().flatten() for d in range(n)]
+    ncell = n * n
+    idx = torch.zeros(n_sets, ncell, dtype=torch.long)
     for j in range(n_sets):
-        sq = _LATIN[rng.randrange(len(_LATIN))]
-        for c in range(N_LATIN):
+        sq = enum[rng.randrange(len(enum))].tolist() if enum is not None else random_latin_square(n, rng)
+        for c in range(ncell):
             d = int(sq[c]); pool = by_digit[d]; idx[j, c] = pool[rng.randrange(len(pool))]
     return idx, torch.ones(n_sets, dtype=torch.long)
 
 
 class LatinProblem(Problem):
-    """4x4 visual Latin square: 16 symbol concepts in {0..3}. Dense graded reward (graded_reward=True);
-    y_from_w = full-validity indicator (used only for the variational conditioning / eval)."""
+    """Order-n visual Latin square: n*n symbol concepts in {0..n-1}. Dense graded reward
+    (graded_reward=True); y_from_w = full-validity indicator (used only for variational cond / eval)."""
     graded_reward = True
 
+    def __init__(self, n=4):
+        self.n = n
+
     def shape_w(self):
-        return (N_LATIN, V_LATIN)                         # (16, 4)
+        return (self.n * self.n, self.n)                  # (n*n, n)
 
     def shape_y(self):
         return (1, 2)
@@ -265,7 +274,7 @@ class LatinProblem(Problem):
     def y_from_w(self, w):                                # full validity (r==1) as a binary y
         return (latin_reward(w) >= 1.0).long().unsqueeze(-1)
 
-    def reward(self, w):                                 # w[S,B,16] -> [S,B] graded reward in [0,1]
+    def reward(self, w):                                 # w[S,B,n*n] -> [S,B] graded reward in [0,1]
         return latin_reward(w)
 
 
@@ -273,7 +282,7 @@ TASKS = {
     "repeat": dict(V=V_REPEAT, n=N_REPEAT, gen=make_repeat_sets, problem=lambda: HasRepeatProblem(N_REPEAT, "repeat")),
     "conn":   dict(V=V_GRAPH, n=2 * M_EDGES, gen=gen_conn_sets, problem=lambda: GraphProblem("conn")),
     "col3":   dict(V=V_GRAPH, n=2 * M_EDGES, gen=gen_color_sets, problem=lambda: GraphProblem("col3")),
-    "latin":  dict(V=V_LATIN, n=N_LATIN, gen=gen_latin_sets, problem=lambda: LatinProblem()),
+    # "latin" is handled specially in run_one (order set by --latin_n): V=n, n*n cells.
 }
 
 
@@ -340,9 +349,17 @@ def collect_preds(model, imgs, ylab, idx, lab, problem, V, n, bs=256):
 
 
 def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, conv_thresh,
-            orbit_M=0, orbit_weights="uniform"):
+            orbit_M=0, orbit_weights="uniform", latin_n=4):
     set_seed(seed)
-    cfg = TASKS[task]; V, n = cfg["V"], cfg["n"]
+    if task == "latin":                                       # order set by --latin_n: V=n, n*n cells
+        V = latin_n; n = latin_n * latin_n
+        enum = all_latin_squares(latin_n) if latin_n == 4 else None
+        gen = lambda yp, ns, sd: gen_latin_sets(yp, ns, sd, latin_n, enum)
+        problem = LatinProblem(latin_n)
+        task_label = "latin" if latin_n == 4 else f"latin{latin_n}"
+    else:
+        cfg = TASKS[task]; V, n = cfg["V"], cfg["n"]
+        gen = cfg["gen"]; problem = cfg["problem"](); task_label = task
 
     # NeSyDM args: defaults for all diffusion internals; only lr and world-sample count K overridden.
     args = MNISTAbsorbingArguments(explicit_bool=True).parse_args(
@@ -351,19 +368,17 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
 
     xtr, ytr = load(True); xte, yte = load(False)
     xval, yval = xtr[50000:], ytr[50000:]; xtr, ytr = xtr[:50000], ytr[:50000]
-    tr_idx, tr_lab = cfg["gen"](ytr, n_sets, seed)
-    va_idx, va_lab = cfg["gen"](yval, 4000, seed + 777)
-    te_idx, te_lab = cfg["gen"](yte, 4000, 424242)
+    tr_idx, tr_lab = gen(ytr, n_sets, seed)
+    va_idx, va_lab = gen(yval, 4000, seed + 777)
+    te_idx, te_lab = gen(yte, 4000, 424242)
 
-    problem = cfg["problem"]()
     model = SimpleNeSyDiffusion(CNNUnmaskingModel(n, V, args), problem, args).to(DEV)
     model.orbit_M = orbit_M                                    # 0 = vanilla NeSyDM; >0 activates OrbitA graft
     model.orbit_weights = orbit_weights                       # "uniform" (ESS=M) or "softmax" (H2 risk)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     log = _Log()
 
-    otag = "" if orbit_M == 0 else f"_M{orbit_M}{orbit_weights[0]}"
-    tag = f"{task}_lr{lr:g}_K{K}_M{orbit_M}{orbit_weights[0] if orbit_M else ''}_seed{seed}"
+    tag = f"{task_label}_lr{lr:g}_K{K}_M{orbit_M}{orbit_weights[0] if orbit_M else ''}_seed{seed}"
     logf = os.path.join(outdir, tag + ".log")
     with open(logf, "w") as f:
         f.write(f"# task={task} K={K} lr={lr} seed={seed} n={n} V={V} n_sets={n_sets} "
@@ -409,7 +424,8 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
                best_epoch=best_ep, converged=int(best_test >= conv_thresh), conv_thresh=conv_thresh,
                n=n, V=V, n_sets=n_sets, batch_size=batch_size, loss_S=K, variational_K=K,
                orbit_M=orbit_M, orbit_weights=orbit_weights, orbit_ess_at_bestval=best_ess,
-               metric=("reward" if getattr(problem, "graded_reward", False) else "label_acc"))
+               metric=("reward" if getattr(problem, "graded_reward", False) else "label_acc"),
+               latin_n=(latin_n if task == "latin" else None))
     with open(os.path.join(outdir, tag + ".json"), "w") as f:
         json.dump(res, f, indent=2)
     print(f"== RESULT {tag}: test@bestval {best_test:.4f} (val {best_val:.4f}, ep {best_ep}) "
@@ -431,12 +447,13 @@ def main():
     ap.add_argument("--conv_thresh", type=float, default=0.9)
     ap.add_argument("--orbit_M", type=int, default=0, help="0=vanilla NeSyDM; >0 activates OrbitA graft")
     ap.add_argument("--orbit_weights", default="uniform", choices=["uniform", "softmax"])
+    ap.add_argument("--latin_n", type=int, default=4, help="Latin-square order for --task latin")
     a, _ = ap.parse_known_args()
     os.makedirs(a.outdir, exist_ok=True)
-    print(f"NeSyDM task={a.task} K={a.K} lr={a.lr} seed={a.seed} orbit_M={a.orbit_M} "
+    print(f"NeSyDM task={a.task} latin_n={a.latin_n} K={a.K} lr={a.lr} seed={a.seed} orbit_M={a.orbit_M} "
           f"orbit_weights={a.orbit_weights} device={DEV} MNIST_ROOT={MNIST_ROOT}", flush=True)
     run_one(a.task, a.K, a.lr, a.seed, a.epochs, a.n_sets, a.patience, a.batch_size, a.outdir,
-            a.conv_thresh, a.orbit_M, a.orbit_weights)
+            a.conv_thresh, a.orbit_M, a.orbit_weights, a.latin_n)
 
 
 if __name__ == "__main__":
