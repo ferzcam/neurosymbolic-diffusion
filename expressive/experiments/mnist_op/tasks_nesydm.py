@@ -246,6 +246,26 @@ def evaluate(model, imgs, ylab, idx, lab, problem, V, n, bs=256):
     return lc / len(idx), cc / (tot * n)
 
 
+@torch.no_grad()
+def collect_preds(model, imgs, ylab, idx, lab, problem, V, n, bs=256):
+    """Dump test-set predictions for concept_acc.py: concept marginal probs (same readout as
+    evaluate), predicted label (phi of argmax), true label, true concept ids."""
+    model.eval(); cps, pls, tcs = [], [], []
+    for i in range(0, len(idx), bs):
+        b = idx[i:i + bs]
+        x = imgs[b].squeeze(2).to(DEV)                   # [B,n,28,28]
+        B = x.shape[0]
+        enc = model.p.encode_x(x)
+        masked = torch.full((B, n), V, device=DEV)
+        p = model.p.distribution(masked, enc, torch.zeros(B, device=DEV))[..., :V]   # [B,n,V]
+        pred = problem.y_from_w(p.argmax(-1)).squeeze(-1).long().cpu()
+        cps.append(p.cpu().numpy().astype(np.float32))
+        pls.append(pred.numpy()); tcs.append(ylab[b].numpy())
+    model.train()
+    return (np.concatenate(cps), np.concatenate(pls),
+            lab.numpy().astype(np.int64), np.concatenate(tcs).astype(np.int64))
+
+
 def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, conv_thresh):
     set_seed(seed)
     cfg = TASKS[task]; V, n = cfg["V"], cfg["n"]
@@ -290,6 +310,10 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
         print(f"[{tag}] ep{ep} loss {float(loss):.3f} val {va:.3f} test {te:.3f} cacc {tca:.3f}", flush=True)
         if va > best_val + 1e-4:
             best_val, best_test, best_ep, since = va, te, ep, 0
+            # Save test-set predictions AT best-val (overwrite) for concept_acc.py (up-to-relabeling).
+            cp, pl, tl, tc = collect_preds(model, xte, yte, te_idx, te_lab, problem, V, n)
+            np.savez(os.path.join(outdir, tag + "_preds.npz"),
+                     concept_probs=cp, pred_label=pl, true_label=tl, true_concepts=tc)
         else:
             since += 1
         if since >= patience:
