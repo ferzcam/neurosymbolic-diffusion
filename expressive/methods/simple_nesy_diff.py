@@ -137,8 +137,14 @@ class SimpleNeSyDiffusion(BaseNeSyDiffusion):
             sig_MV[0] = torch.arange(V, device=dev)                     # anchor identity
             w_sig_MSBW = sig_MV[:, tw_0_SBW]                            # [M,S,B,W]
             logq_MSB = tw_0.log_prob(w_sig_MSBW).sum(-1)               # [M,S,B]
-            wts_MSB = torch.softmax(logq_MSB.detach(), dim=0)          # q-weighted (self-norm)
-            log_probs_SB = (wts_MSB * logq_MSB).sum(0)                 # [S,B]
+            orbit_weights = getattr(self, "orbit_weights", "softmax")
+            if orbit_weights == "uniform":
+                # UNIFORM (unweighted) orbit average -> ESS = M by construction, so the average
+                # genuinely spans the orbit instead of collapsing onto identity (H2 fix).
+                wts_MSB = torch.full_like(logq_MSB, 1.0 / orbit_M)
+            else:
+                wts_MSB = torch.softmax(logq_MSB.detach(), dim=0)      # belief-weighted (H2 risk)
+            log_probs_SB = (wts_MSB.detach() * logq_MSB).sum(0)       # [S,B]
             # DIAGNOSTIC: effective # of orbit members (ESS). ~1 => averaging collapsed to
             # identity (carry-over one-hot positions kill relabeled worlds); ~M => full averaging.
             self.orbit_ess = float((1.0 / wts_MSB.pow(2).sum(0)).mean())

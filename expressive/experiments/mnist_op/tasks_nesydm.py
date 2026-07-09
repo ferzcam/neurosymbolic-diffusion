@@ -266,7 +266,8 @@ def collect_preds(model, imgs, ylab, idx, lab, problem, V, n, bs=256):
             lab.numpy().astype(np.int64), np.concatenate(tcs).astype(np.int64))
 
 
-def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, conv_thresh):
+def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, conv_thresh,
+            orbit_M=0, orbit_weights="uniform"):
     set_seed(seed)
     cfg = TASKS[task]; V, n = cfg["V"], cfg["n"]
 
@@ -283,18 +284,23 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
 
     problem = cfg["problem"]()
     model = SimpleNeSyDiffusion(CNNUnmaskingModel(n, V, args), problem, args).to(DEV)
+    model.orbit_M = orbit_M                                    # 0 = vanilla NeSyDM; >0 activates OrbitA graft
+    model.orbit_weights = orbit_weights                       # "uniform" (ESS=M) or "softmax" (H2 risk)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     log = _Log()
 
-    tag = f"{task}_lr{lr:g}_K{K}_seed{seed}"
+    otag = "" if orbit_M == 0 else f"_M{orbit_M}{orbit_weights[0]}"
+    tag = f"{task}_lr{lr:g}_K{K}_M{orbit_M}{orbit_weights[0] if orbit_M else ''}_seed{seed}"
     logf = os.path.join(outdir, tag + ".log")
     with open(logf, "w") as f:
         f.write(f"# task={task} K={K} lr={lr} seed={seed} n={n} V={V} n_sets={n_sets} "
-                f"batch_size={batch_size} loss_S={K} variational_K={K} epochs={epochs} patience={patience}\n")
+                f"batch_size={batch_size} loss_S={K} variational_K={K} epochs={epochs} patience={patience} "
+                f"orbit_M={orbit_M} orbit_weights={orbit_weights}\n")
 
-    best_val, best_test, best_ep, since = -1.0, 0.0, -1, 0
+    best_val, best_test, best_ep, since, best_ess = -1.0, 0.0, -1, 0, float("nan")
     for ep in range(epochs):
         model.train(); perm = torch.randperm(n_sets); t0 = time.time()
+        ess_sum, ess_n = 0.0, 0
         for i in range(0, n_sets, batch_size):
             b = tr_idx[perm[i:i + batch_size]]
             x = xtr[b].squeeze(2).to(DEV)                # [B,n,28,28]
@@ -302,13 +308,17 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
             label = tr_lab[perm[i:i + batch_size]].to(DEV).long().reshape(-1, 1)   # [B,1]
             loss = model.loss(x, label, log, w_labels)
             opt.zero_grad(); loss.backward(); opt.step()
+            if orbit_M > 0:
+                ess_sum += getattr(model, "orbit_ess", float("nan")); ess_n += 1
+        ess = ess_sum / ess_n if ess_n else float("nan")   # mean effective # relabelings this epoch
         va, vca = evaluate(model, xval, yval, va_idx, va_lab, problem, V, n)
         te, tca = evaluate(model, xte, yte, te_idx, te_lab, problem, V, n)
         with open(logf, "a") as f:
             f.write(f"epoch {ep}\tloss {float(loss):.4f}\tval_acc {va:.4f}\ttest_acc {te:.4f}"
-                    f"\tval_cacc {vca:.4f}\ttest_cacc {tca:.4f}\ttime {time.time()-t0:.1f}\n")
-        print(f"[{tag}] ep{ep} loss {float(loss):.3f} val {va:.3f} test {te:.3f} cacc {tca:.3f}", flush=True)
+                    f"\tval_cacc {vca:.4f}\ttest_cacc {tca:.4f}\torbit_ess {ess:.3f}\ttime {time.time()-t0:.1f}\n")
+        print(f"[{tag}] ep{ep} loss {float(loss):.3f} val {va:.3f} test {te:.3f} cacc {tca:.3f} ess {ess:.2f}", flush=True)
         if va > best_val + 1e-4:
+            best_ess = ess
             best_val, best_test, best_ep, since = va, te, ep, 0
             # Save test-set predictions AT best-val (overwrite) for concept_acc.py (up-to-relabeling).
             cp, pl, tl, tc = collect_preds(model, xte, yte, te_idx, te_lab, problem, V, n)
@@ -321,7 +331,8 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
 
     res = dict(task=task, K=K, lr=lr, seed=seed, best_val=best_val, test_at_bestval=best_test,
                best_epoch=best_ep, converged=int(best_test >= conv_thresh), conv_thresh=conv_thresh,
-               n=n, V=V, n_sets=n_sets, batch_size=batch_size, loss_S=K, variational_K=K)
+               n=n, V=V, n_sets=n_sets, batch_size=batch_size, loss_S=K, variational_K=K,
+               orbit_M=orbit_M, orbit_weights=orbit_weights, orbit_ess_at_bestval=best_ess)
     with open(os.path.join(outdir, tag + ".json"), "w") as f:
         json.dump(res, f, indent=2)
     print(f"== RESULT {tag}: test@bestval {best_test:.4f} (val {best_val:.4f}, ep {best_ep}) "
@@ -341,11 +352,14 @@ def main():
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--outdir", default="runs_tasks_nesydm")
     ap.add_argument("--conv_thresh", type=float, default=0.9)
+    ap.add_argument("--orbit_M", type=int, default=0, help="0=vanilla NeSyDM; >0 activates OrbitA graft")
+    ap.add_argument("--orbit_weights", default="uniform", choices=["uniform", "softmax"])
     a, _ = ap.parse_known_args()
     os.makedirs(a.outdir, exist_ok=True)
-    print(f"NeSyDM baseline task={a.task} K={a.K} lr={a.lr} seed={a.seed} device={DEV} "
-          f"MNIST_ROOT={MNIST_ROOT}", flush=True)
-    run_one(a.task, a.K, a.lr, a.seed, a.epochs, a.n_sets, a.patience, a.batch_size, a.outdir, a.conv_thresh)
+    print(f"NeSyDM task={a.task} K={a.K} lr={a.lr} seed={a.seed} orbit_M={a.orbit_M} "
+          f"orbit_weights={a.orbit_weights} device={DEV} MNIST_ROOT={MNIST_ROOT}", flush=True)
+    run_one(a.task, a.K, a.lr, a.seed, a.epochs, a.n_sets, a.patience, a.batch_size, a.outdir,
+            a.conv_thresh, a.orbit_M, a.orbit_weights)
 
 
 if __name__ == "__main__":
