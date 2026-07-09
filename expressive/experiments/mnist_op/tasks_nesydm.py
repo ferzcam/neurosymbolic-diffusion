@@ -200,10 +200,80 @@ class GraphProblem(Problem):
         return self.phi(w).long().unsqueeze(-1)
 
 
+# ----------------------------------------------------------------------------------------------
+# Visual Latin square (order 4): 16 cells, symbols {0..3} (V=4), DENSE graded reward.
+# Ported from method/latin_train.py: reward r(w) = (#all-different among 4 rows+4 cols)/8, S_4-invariant.
+# ----------------------------------------------------------------------------------------------
+V_LATIN, N_LATIN = 4, 16
+
+
+def all_latin_squares(V=4):
+    perms = [list(p) for p in itertools.permutations(range(V))]
+    res = []
+
+    def ok(rows, p):
+        return all(all(p[c] != rows[r][c] for r in range(len(rows))) for c in range(V))
+
+    def bt(rows):
+        if len(rows) == V:
+            res.append([x for r in rows for x in r]); return
+        for p in perms:
+            if ok(rows, p):
+                bt(rows + [p])
+    bt([])
+    return torch.tensor(res, dtype=torch.long)           # [576, 16]
+
+
+_LATIN = all_latin_squares(V_LATIN)
+
+
+def latin_reward(w):                                     # w[...,16] in {0..3} -> r[...] in [0,1]
+    lead = w.shape[:-1]
+    g = w.reshape(*lead, V_LATIN, V_LATIN)
+
+    def alldiff(x):
+        return (F.one_hot(x, V_LATIN).sum(-2) == 1).all(-1)
+    rows = alldiff(g).float().sum(-1)
+    cols = alldiff(g.transpose(-1, -2)).float().sum(-1)
+    return (rows + cols) / (2 * V_LATIN)
+
+
+def gen_latin_sets(ypool, n_sets, seed):
+    """Balanced sampling over the 576 Latin squares; each cell = random MNIST image of its symbol.
+    Returns (image indices [n_sets,16], lab=ones). true concepts come from ypool[idx] as elsewhere."""
+    rng = random.Random(seed)
+    by_digit = [(ypool == d).nonzero().flatten() for d in range(V_LATIN)]
+    idx = torch.zeros(n_sets, N_LATIN, dtype=torch.long)
+    for j in range(n_sets):
+        sq = _LATIN[rng.randrange(len(_LATIN))]
+        for c in range(N_LATIN):
+            d = int(sq[c]); pool = by_digit[d]; idx[j, c] = pool[rng.randrange(len(pool))]
+    return idx, torch.ones(n_sets, dtype=torch.long)
+
+
+class LatinProblem(Problem):
+    """4x4 visual Latin square: 16 symbol concepts in {0..3}. Dense graded reward (graded_reward=True);
+    y_from_w = full-validity indicator (used only for the variational conditioning / eval)."""
+    graded_reward = True
+
+    def shape_w(self):
+        return (N_LATIN, V_LATIN)                         # (16, 4)
+
+    def shape_y(self):
+        return (1, 2)
+
+    def y_from_w(self, w):                                # full validity (r==1) as a binary y
+        return (latin_reward(w) >= 1.0).long().unsqueeze(-1)
+
+    def reward(self, w):                                 # w[S,B,16] -> [S,B] graded reward in [0,1]
+        return latin_reward(w)
+
+
 TASKS = {
     "repeat": dict(V=V_REPEAT, n=N_REPEAT, gen=make_repeat_sets, problem=lambda: HasRepeatProblem(N_REPEAT, "repeat")),
     "conn":   dict(V=V_GRAPH, n=2 * M_EDGES, gen=gen_conn_sets, problem=lambda: GraphProblem("conn")),
     "col3":   dict(V=V_GRAPH, n=2 * M_EDGES, gen=gen_color_sets, problem=lambda: GraphProblem("col3")),
+    "latin":  dict(V=V_LATIN, n=N_LATIN, gen=gen_latin_sets, problem=lambda: LatinProblem()),
 }
 
 
@@ -229,11 +299,12 @@ def load(train):
 def evaluate(model, imgs, ylab, idx, lab, problem, V, n, bs=256):
     """Concept-marginal readout (mirrors has_repeat.evaluate): concept argmax then phi.
     label-acc = phi(argmax concept) vs lab ; concept-acc = argmax vs true digit ids."""
-    model.eval(); lc = cc = tot = 0
+    model.eval(); lc = cc = tot = 0; rw = 0.0
+    graded = getattr(problem, "graded_reward", False)
     for i in range(0, len(idx), bs):
         b = idx[i:i + bs]
         x = imgs[b].squeeze(2).to(DEV)                   # [B,n,28,28]
-        gt = ylab[b].to(DEV)                             # [B,n] true node-ids
+        gt = ylab[b].to(DEV)                             # [B,n] true concept ids
         B = x.shape[0]
         enc = model.p.encode_x(x)
         masked = torch.full((B, n), V, device=DEV)       # mask value = vocab_dim = V
@@ -242,8 +313,10 @@ def evaluate(model, imgs, ylab, idx, lab, problem, V, n, bs=256):
         pred = problem.y_from_w(w_hat).squeeze(-1).long().cpu()
         lc += (pred == lab[i:i + bs]).sum().item()
         cc += (w_hat == gt).float().sum().item(); tot += B
+        if graded:
+            rw += problem.reward(w_hat).sum().item()     # mean graded reward of argmax world
     model.train()
-    return lc / len(idx), cc / (tot * n)
+    return lc / len(idx), cc / (tot * n), (rw / len(idx) if graded else float("nan"))
 
 
 @torch.no_grad()
@@ -311,15 +384,18 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
             if orbit_M > 0:
                 ess_sum += getattr(model, "orbit_ess", float("nan")); ess_n += 1
         ess = ess_sum / ess_n if ess_n else float("nan")   # mean effective # relabelings this epoch
-        va, vca = evaluate(model, xval, yval, va_idx, va_lab, problem, V, n)
-        te, tca = evaluate(model, xte, yte, te_idx, te_lab, problem, V, n)
+        va, vca, vrw = evaluate(model, xval, yval, va_idx, va_lab, problem, V, n)
+        te, tca, trw = evaluate(model, xte, yte, te_idx, te_lab, problem, V, n)
+        graded = getattr(problem, "graded_reward", False)
+        sel, tst = (vrw, trw) if graded else (va, te)     # graded tasks: select/report on mean reward
         with open(logf, "a") as f:
             f.write(f"epoch {ep}\tloss {float(loss):.4f}\tval_acc {va:.4f}\ttest_acc {te:.4f}"
-                    f"\tval_cacc {vca:.4f}\ttest_cacc {tca:.4f}\torbit_ess {ess:.3f}\ttime {time.time()-t0:.1f}\n")
-        print(f"[{tag}] ep{ep} loss {float(loss):.3f} val {va:.3f} test {te:.3f} cacc {tca:.3f} ess {ess:.2f}", flush=True)
-        if va > best_val + 1e-4:
+                    f"\tval_cacc {vca:.4f}\ttest_cacc {tca:.4f}\tval_reward {vrw:.4f}\ttest_reward {trw:.4f}"
+                    f"\torbit_ess {ess:.3f}\ttime {time.time()-t0:.1f}\n")
+        print(f"[{tag}] ep{ep} loss {float(loss):.3f} sel {sel:.3f} test {tst:.3f} cacc {tca:.3f} ess {ess:.2f}", flush=True)
+        if sel > best_val + 1e-4:
             best_ess = ess
-            best_val, best_test, best_ep, since = va, te, ep, 0
+            best_val, best_test, best_ep, since = sel, tst, ep, 0
             # Save test-set predictions AT best-val (overwrite) for concept_acc.py (up-to-relabeling).
             cp, pl, tl, tc = collect_preds(model, xte, yte, te_idx, te_lab, problem, V, n)
             np.savez(os.path.join(outdir, tag + "_preds.npz"),
@@ -332,7 +408,8 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
     res = dict(task=task, K=K, lr=lr, seed=seed, best_val=best_val, test_at_bestval=best_test,
                best_epoch=best_ep, converged=int(best_test >= conv_thresh), conv_thresh=conv_thresh,
                n=n, V=V, n_sets=n_sets, batch_size=batch_size, loss_S=K, variational_K=K,
-               orbit_M=orbit_M, orbit_weights=orbit_weights, orbit_ess_at_bestval=best_ess)
+               orbit_M=orbit_M, orbit_weights=orbit_weights, orbit_ess_at_bestval=best_ess,
+               metric=("reward" if getattr(problem, "graded_reward", False) else "label_acc"))
     with open(os.path.join(outdir, tag + ".json"), "w") as f:
         json.dump(res, f, indent=2)
     print(f"== RESULT {tag}: test@bestval {best_test:.4f} (val {best_val:.4f}, ep {best_ep}) "
@@ -342,7 +419,7 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--task", default="conn", choices=["repeat", "conn", "col3"])
+    ap.add_argument("--task", default="conn", choices=["repeat", "conn", "col3", "latin"])
     ap.add_argument("--K", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=0)

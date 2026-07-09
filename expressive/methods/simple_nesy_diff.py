@@ -152,7 +152,14 @@ class SimpleNeSyDiffusion(BaseNeSyDiffusion):
             log_probs_SB = tw_0.log_prob(tw_0_SBW).sum(-1)
         # Compute all constraints for y
         constraint_y0_SBY = (y_0_BY[None, :, :] == ty_0_SBY).float()
-        reward_y_0_SBY = constraint_y0_SBY
+        if getattr(self.problem, "graded_reward", False):
+            # Graded (dense) reward objective: feed r(w) in [0,1] straight into the RLOO estimator
+            # (reward_y_0_SBY is exactly what rloo_loss below treats as the reward), as a single
+            # D=1 reward dim, instead of the per-y-dim binary constraint match. Reward is
+            # relabeling-invariant so the orbit-averaged score is unaffected.
+            reward_y_0_SBY = self.problem.reward(tw_0_SBW).unsqueeze(-1)
+        else:
+            reward_y_0_SBY = constraint_y0_SBY
 
         # Compute the RLOO loss for all constraints. Uses LOO with w0 injection
         L_denoising_BY = self.rloo_loss(
