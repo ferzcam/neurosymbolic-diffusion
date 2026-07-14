@@ -349,7 +349,9 @@ def collect_preds(model, imgs, ylab, idx, lab, problem, V, n, bs=256):
 
 
 def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, conv_thresh,
-            orbit_M=0, orbit_weights="uniform", latin_n=4):
+            orbit_M=0, orbit_weights="uniform", latin_n=4,
+            gamma_H=None, gamma_c=None, beta=None, entropy_variant=None,
+            no_signal_epoch=60, no_signal_thresh=0.55):
     set_seed(seed)
     if task == "latin":                                       # order set by --latin_n: V=n, n*n cells
         V = latin_n; n = latin_n * latin_n
@@ -365,6 +367,13 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
     args = MNISTAbsorbingArguments(explicit_bool=True).parse_args(
         ["--use_wandb", "False", "--lr", str(lr), "--batch_size", str(batch_size)], known_only=True)
     args.loss_S = K; args.variational_K = K; args.test_K = K   # our K == NeSyDM world samples
+    # Grid-searchable loss weights (paper Appendix G): entropy_weight=gamma_H (RS-collapse knob),
+    # w_denoise_weight=gamma_c, beta, entropy_variant. None => keep MNISTAbsorbingArguments default.
+    if gamma_H is not None: args.entropy_weight = gamma_H
+    if gamma_c is not None: args.w_denoise_weight = gamma_c
+    if beta is not None: args.beta = beta
+    if entropy_variant is not None: args.entropy_variant = entropy_variant
+    hp = f"_gH{args.entropy_weight:g}_gc{args.w_denoise_weight:g}_b{args.beta:g}_{args.entropy_variant}"
 
     xtr, ytr = load(True); xte, yte = load(False)
     xval, yval = xtr[50000:], ytr[50000:]; xtr, ytr = xtr[:50000], ytr[:50000]
@@ -378,11 +387,13 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     log = _Log()
 
-    tag = f"{task_label}_lr{lr:g}_K{K}_M{orbit_M}{orbit_weights[0] if orbit_M else ''}_seed{seed}"
+    tag = f"{task_label}_lr{lr:g}_K{K}{hp}_M{orbit_M}{orbit_weights[0] if orbit_M else ''}_seed{seed}"
     logf = os.path.join(outdir, tag + ".log")
     with open(logf, "w") as f:
         f.write(f"# task={task} K={K} lr={lr} seed={seed} n={n} V={V} n_sets={n_sets} "
                 f"batch_size={batch_size} loss_S={K} variational_K={K} epochs={epochs} patience={patience} "
+                f"entropy_weight={args.entropy_weight} w_denoise_weight={args.w_denoise_weight} "
+                f"beta={args.beta} entropy_variant={args.entropy_variant} "
                 f"orbit_M={orbit_M} orbit_weights={orbit_weights}\n")
 
     best_val, best_test, best_ep, since, best_ess = -1.0, 0.0, -1, 0, float("nan")
@@ -419,10 +430,17 @@ def run_one(task, K, lr, seed, epochs, n_sets, patience, batch_size, outdir, con
             since += 1
         if since >= patience:
             break
+        if ep >= no_signal_epoch and best_val < no_signal_thresh:   # no-signal kill (grid efficiency)
+            with open(logf, "a") as f:
+                f.write(f"# no-signal kill at ep {ep}: best_val {best_val:.4f} < {no_signal_thresh}\n")
+            print(f"[{tag}] NO SIGNAL by ep{ep} (best_val {best_val:.3f} < {no_signal_thresh}), killing.", flush=True)
+            break
 
     res = dict(task=task, K=K, lr=lr, seed=seed, best_val=best_val, test_at_bestval=best_test,
                best_epoch=best_ep, converged=int(best_test >= conv_thresh), conv_thresh=conv_thresh,
                n=n, V=V, n_sets=n_sets, batch_size=batch_size, loss_S=K, variational_K=K,
+               entropy_weight=args.entropy_weight, w_denoise_weight=args.w_denoise_weight,
+               beta=args.beta, entropy_variant=args.entropy_variant,
                orbit_M=orbit_M, orbit_weights=orbit_weights, orbit_ess_at_bestval=best_ess,
                metric=("reward" if getattr(problem, "graded_reward", False) else "label_acc"),
                latin_n=(latin_n if task == "latin" else None))
@@ -448,12 +466,21 @@ def main():
     ap.add_argument("--orbit_M", type=int, default=0, help="0=vanilla NeSyDM; >0 activates OrbitA graft")
     ap.add_argument("--orbit_weights", default="uniform", choices=["uniform", "softmax"])
     ap.add_argument("--latin_n", type=int, default=4, help="Latin-square order for --task latin")
+    # Loss-weight grid knobs (Appendix G). None => keep MNISTAbsorbingArguments default.
+    ap.add_argument("--gamma_H", type=float, default=None, help="entropy_weight override (RS-collapse knob)")
+    ap.add_argument("--gamma_c", type=float, default=None, help="w_denoise_weight override")
+    ap.add_argument("--beta", type=float, default=None, help="beta (constraint temperature) override")
+    ap.add_argument("--entropy_variant", default=None, choices=["unconditional", "exact_conditional"],
+                    help="paper uses exact_conditional for reasoning-shortcut tasks")
+    ap.add_argument("--no_signal_epoch", type=int, default=60, help="kill run if no signal by this epoch")
+    ap.add_argument("--no_signal_thresh", type=float, default=0.55, help="best_val below this => no signal")
     a, _ = ap.parse_known_args()
     os.makedirs(a.outdir, exist_ok=True)
     print(f"NeSyDM task={a.task} latin_n={a.latin_n} K={a.K} lr={a.lr} seed={a.seed} orbit_M={a.orbit_M} "
           f"orbit_weights={a.orbit_weights} device={DEV} MNIST_ROOT={MNIST_ROOT}", flush=True)
     run_one(a.task, a.K, a.lr, a.seed, a.epochs, a.n_sets, a.patience, a.batch_size, a.outdir,
-            a.conv_thresh, a.orbit_M, a.orbit_weights, a.latin_n)
+            a.conv_thresh, a.orbit_M, a.orbit_weights, a.latin_n,
+            a.gamma_H, a.gamma_c, a.beta, a.entropy_variant, a.no_signal_epoch, a.no_signal_thresh)
 
 
 if __name__ == "__main__":
