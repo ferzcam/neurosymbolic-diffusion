@@ -9,7 +9,10 @@
 #SBATCH --error=/ibex/user/zhapacfp/neurosymbolic-diffusion/slurm_logs/graphgrid_%A_%a.out
 
 # Vanilla NeSyDM (orbit_M=0) reduced hyperparameter grid on the graph tasks.
-# Tune {lr, gamma_H, gamma_c} at K=16 with exact_conditional, per task; then 16-seed the winner.
+# Tune {lr, gamma_H, gamma_c} at K=16 with UNCONDITIONAL entropy, per task; then 16-seed the winner.
+# NOTE: exact_conditional entropy enumerates the full world space (6^14 for conn) -> OOM/intractable on
+# these tasks, so NeSyDM is limited to unconditional entropy here (the tractable variant, as in the
+# original runs).
 # task(2) x gamma_H(3) x lr(3) x gamma_c(2) = 36 configs, seed 0.
 # SLURM_ARRAY_TASK_ID -> (task, gamma_H, lr, gamma_c) via mixed-radix indexing.
 
@@ -41,7 +44,7 @@ cd "$REPO"
 srun "$PY" -m expressive.experiments.mnist_op.tasks_nesydm \
   --task "$task" --K 16 --lr "$lr" \
   --gamma_H "$gH" --gamma_c "$gc" --beta 10 \
-  --entropy_variant exact_conditional --seed 0 --orbit_M 0 \
+  --entropy_variant unconditional --seed 0 --orbit_M 0 \
   --epochs 200 --patience 30 \
   --no_signal_epoch 60 --no_signal_thresh 0.55 \
   --n_sets 8000 --outdir "$OUT"
